@@ -2,6 +2,8 @@
 
 This program fetches train departure times from a JSON API and displays them on a Waveshare 7.5-inch e-paper display (800x480px) connected to an ESP32.
 
+Note: I couldn't get partial refresh to work properly, so I am using 'fast refresh'. 
+
 ## Features
 
 - **WiFi Connectivity**: Connects to local WiFi network
