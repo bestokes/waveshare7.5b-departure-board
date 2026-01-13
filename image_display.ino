@@ -8,9 +8,16 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 
+#include <time.h>
+
 /* WiFi credentials */
-const char* ssid = "xxxxxx";
-const char* password = "xxxxxxxxx";
+const char* ssid = "ssid-name";
+const char* password = "password";
+
+/* NTP Server */
+const char* ntpServer = "pool.ntp.org";
+const long  gmtOffset_sec = 0;
+const int   daylightOffset_sec = 3600;
 
 /* API URL */
 const char* apiUrl = "http://192.168.1.131:5001/api/departures";
@@ -22,6 +29,8 @@ UWORD imageSize;
 /* Refresh interval */
 const unsigned long refreshInterval = 30000; // 30 seconds
 unsigned long lastRefresh = 0;
+unsigned long lastFullRefresh = 0;
+const unsigned long fullRefreshInterval = 3600000; // 1 hour
 
 /* Partial refresh tracking */
 bool firstDisplay = true;
@@ -37,7 +46,9 @@ void displayError(const char* message);
 void displayTrainRow(int platform, int row, const char* time, const char* destination, const char* operatorName, const char* status, bool isDelayed);
 bool parseJSONResponse(String& payload, char* stationName, char* lastUpdated, char* platform1Data, char* platform2Data);
 bool extractTrainData(const char* platformData, int trainIndex, char* time, char* destination, char* operatorName, char* status, char* statusClass, bool* isCancelled);
-void partialRefreshTrainData(char* lastUpdated, char* platform1Data, char* platform2Data);
+void performPartialTimestampUpdate(char* lastUpdated);
+void drawMainScreen(char* stationName, char* lastUpdated, char* platform1Data, char* platform2Data);
+bool isQuietHours();
 
 /* Entry point ----------------------------------------------------------------*/
 void setup()
@@ -66,7 +77,7 @@ void setup()
   
   // Initialize paint with image buffer (1-bit monochrome)
   Paint_NewImage(imageBuffer, EPD_7IN5_V2_WIDTH, EPD_7IN5_V2_HEIGHT, 0, WHITE);
-  Paint_SetScale(2); // 1-bit mode for memory efficiency
+  Paint_SetScale(2);
   Paint_SetRotate(ROTATE_0);
   
   // Connect to WiFi
@@ -74,11 +85,8 @@ void setup()
     printf("WiFi connection failed! Using offline mode.\r\n");
   }
   
-  // Display initial status
-  Paint_SelectImage(imageBuffer);
-  Paint_Clear(WHITE);
-  Paint_DrawString_EN(200, 200, "Connecting...", &Font24, WHITE, BLACK);
-  EPD_7IN5_V2_Display(imageBuffer);
+  // Configure time
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
   
   printf("Setup complete, starting main loop...\r\n");
 }
@@ -99,20 +107,21 @@ void loop()
     
     lastRefresh = currentTime;
     
-    // Put display to sleep
-    printf("Going to sleep for 30 seconds...\r\n");
-    EPD_7IN5_V2_Sleep();
-    delay(30000); // Sleep for 30 seconds
-    
-    // Wake up display for next refresh
-    if (firstDisplay) {
-      EPD_7IN5_V2_Init();
-    } else {
-      EPD_7IN5_V2_Init_Fast(); // Use fast refresh mode for subsequent updates
+    // Check for quiet hours
+    if (isQuietHours()) {
+        printf("Quiet hours (01:00-05:00), sleeping longer...\n");
+        EPD_7IN5_V2_Sleep();
+        delay(300000); // 5 minutes 
+        
+        // After waking from quiet hours, we must re-init fully
+        EPD_7IN5_V2_Init();
+        firstDisplay = true; 
+        lastRefresh = millis();
+        return;
     }
   }
   
-  delay(100); // Small delay to prevent watchdog timeout
+  delay(100);
 }
 
 /* Connect to WiFi ------------------------------------------------------------*/
@@ -146,7 +155,7 @@ bool fetchAndDisplayTrainTimes() {
   
   HTTPClient http;
   http.begin(apiUrl);
-  http.setTimeout(10000); // 10 second timeout
+  http.setTimeout(10000);
   
   printf("Fetching train times from: %s\n", apiUrl);
   int httpCode = http.GET();
@@ -157,7 +166,6 @@ bool fetchAndDisplayTrainTimes() {
     
     printf("Received JSON data (%d bytes)\n", payload.length());
     
-    // Parse JSON manually (no external library needed)
     char stationName[50] = "Hassocks";
     char lastUpdated[20] = "--:--:--";
     char platform1Data[2000] = "";
@@ -168,234 +176,99 @@ bool fetchAndDisplayTrainTimes() {
       return false;
     }
     
-    // Debug: Print extracted data
-    printf("Last Updated: %s\n", lastUpdated);
-    printf("Platform 1 Data Length: %d\n", strlen(platform1Data));
-    printf("Platform 2 Data Length: %d\n", strlen(platform2Data));
+    bool dataChanged = (strcmp(platform1Data, lastPlatform1Data) != 0) || 
+                       (strcmp(platform2Data, lastPlatform2Data) != 0);
     
-    // Display the final image
-    if (firstDisplay) {
-      // First display - draw everything and do full refresh
-      Paint_SelectImage(imageBuffer);
-      Paint_Clear(WHITE);
-      
-      // Station header (left justified)
-      char header[100];
-      snprintf(header, sizeof(header), "%s Station", stationName);
-      Paint_DrawString_EN(20, 10, header, &Font24, WHITE, BLACK);
-      
-      // Last updated (right justified on same line)
-      char updateStr[50];
-      snprintf(updateStr, sizeof(updateStr), "Updated: %s", lastUpdated);
-      Paint_DrawString_EN(600, 10, updateStr, &Font16, WHITE, BLACK);
-      
-      // Platform headers
-      Paint_DrawString_EN(40, 50, "Platform 1", &Font20, WHITE, BLACK);
-      Paint_DrawString_EN(440, 50, "Platform 2", &Font20, WHITE, BLACK);
-      
-      // Column headers
-      Paint_DrawString_EN(40, 80, "Time", &Font16, WHITE, BLACK);
-      Paint_DrawString_EN(100, 80, "Destination", &Font16, WHITE, BLACK);
-      Paint_DrawString_EN(280, 80, "Status", &Font16, WHITE, BLACK);
-      
-      Paint_DrawString_EN(440, 80, "Time", &Font16, WHITE, BLACK);
-      Paint_DrawString_EN(500, 80, "Destination", &Font16, WHITE, BLACK);
-      Paint_DrawString_EN(680, 80, "Status", &Font16, WHITE, BLACK);
-      
-      // Platform 1 trains
-      for (int row = 0; row < 5; row++) {
-        char time[10] = "";
-        char destination[50] = "";
-        char operatorName[30] = "";
-        char status[20] = "";
-        char statusClass[20] = "";
-        bool isCancelled = false;
-        
-        if (extractTrainData(platform1Data, row, time, destination, operatorName, status, statusClass, &isCancelled)) {
-          bool isDelayed = (strcmp(statusClass, "status-delayed") == 0);
-          
-          displayTrainRow(1, row, time, destination, operatorName, status, isDelayed);
-        }
-      }
-      
-      // Platform 2 trains
-      for (int row = 0; row < 5; row++) {
-        char time[10] = "";
-        char destination[50] = "";
-        char operatorName[30] = "";
-        char status[20] = "";
-        char statusClass[20] = "";
-        bool isCancelled = false;
-        
-        if (extractTrainData(platform2Data, row, time, destination, operatorName, status, statusClass, &isCancelled)) {
-          bool isDelayed = (strcmp(statusClass, "status-delayed") == 0);
-          
-          displayTrainRow(2, row, time, destination, operatorName, status, isDelayed);
-        }
-      }
-      
-      EPD_7IN5_V2_Display(imageBuffer);
-      firstDisplay = false;
-    } else {
-      // Use partial refresh for train data area only
-      partialRefreshTrainData(lastUpdated, platform1Data, platform2Data);
+    unsigned long currentTime = millis();
+    bool hourlyRefreshNeeded = (currentTime - lastFullRefresh >= fullRefreshInterval);
+
+    if (!dataChanged && !firstDisplay && !hourlyRefreshNeeded) {
+        printf("Data unchanged, partial update only.\n");
+        performPartialTimestampUpdate(lastUpdated);
+        strcpy(lastUpdatedTime, lastUpdated); 
+        return true;
     }
     
-    // Store current data for comparison
+    printf("Redrawing main screen\n");
+    
+    if (firstDisplay || hourlyRefreshNeeded) {
+        EPD_7IN5_V2_Init();
+        lastFullRefresh = currentTime;
+    } else {
+        EPD_7IN5_V2_Init_Fast();
+    }
+    
+    drawMainScreen(stationName, lastUpdated, platform1Data, platform2Data);
+    EPD_7IN5_V2_Display(imageBuffer);
+    
+    firstDisplay = false;
     strcpy(lastUpdatedTime, lastUpdated);
     strcpy(lastPlatform1Data, platform1Data);
     strcpy(lastPlatform2Data, platform2Data);
     
-    printf("Train times displayed successfully\n");
     return true;
     
   } else {
-    // HTTP error
     printf("HTTP error: %d\n", httpCode);
-    
     char errorMsg[50];
     snprintf(errorMsg, sizeof(errorMsg), "HTTP Error: %d", httpCode);
     displayError(errorMsg);
-    
     http.end();
     return false;
   }
 }
 
-/* Display a train row in the table ------------------------------------------*/
 void displayTrainRow(int platform, int row, const char* time, const char* destination, const char* operatorName, const char* status, bool isDelayed) {
-  int yPos = 110 + (row * 70);  // Increased row height for two-line layout
+  int yPos = 110 + (row * 70);
   int platformOffset = (platform == 1) ? 0 : 400;
   
-  // Time column
   Paint_DrawString_EN(40 + platformOffset, yPos, time, &Font16, WHITE, BLACK);
   
-  // Destination column (first line)
   char truncatedDest[40];
   strncpy(truncatedDest, destination, 39);
   truncatedDest[39] = '\0';
+  if (strlen(truncatedDest) > 13) {
+      truncatedDest[13] = '.';
+      truncatedDest[14] = '\0';
+  }
   Paint_DrawString_EN(100 + platformOffset, yPos, truncatedDest, &Font16, WHITE, BLACK);
   
-  // Operator column (second line, smaller font)
   char truncatedOp[30];
   strncpy(truncatedOp, operatorName, 29);
   truncatedOp[29] = '\0';
   Paint_DrawString_EN(100 + platformOffset, yPos + 20, truncatedOp, &Font12, WHITE, BLACK);
   
-  // Status column - use different color for delayed trains
-  if (isDelayed) {
-    Paint_DrawString_EN(280 + platformOffset, yPos, status, &Font16, WHITE, BLACK);
-  } else {
-    Paint_DrawString_EN(280 + platformOffset, yPos, status, &Font16, WHITE, BLACK);
-  }
+  Paint_DrawString_EN(280 + platformOffset, yPos, status, &Font16, WHITE, BLACK);
 }
 
-/* Display error message -----------------------------------------------------*/
 void displayError(const char* message) {
+  // Reset Paint to full screen in case of error
+  Paint_NewImage(imageBuffer, EPD_7IN5_V2_WIDTH, EPD_7IN5_V2_HEIGHT, 0, WHITE);
   Paint_SelectImage(imageBuffer);
   Paint_Clear(WHITE);
-  
   Paint_DrawString_EN(200, 180, "Error", &Font24, WHITE, BLACK);
   Paint_DrawString_EN(150, 220, message, &Font20, WHITE, BLACK);
   Paint_DrawString_EN(180, 260, "Retrying...", &Font20, WHITE, BLACK);
-  
   EPD_7IN5_V2_Display(imageBuffer);
 }
 
-/* Display train table layout ------------------------------------------------*/
-void displayTrainTable() {
-  // This function is called before drawing individual rows to set up the layout
-  // The actual drawing happens in displayTrainRow()
-}
-
-/* Parse JSON response manually ----------------------------------------------*/
-bool parseJSONResponse(String& payload, char* stationName, char* lastUpdated, char* platform1Data, char* platform2Data) {
-  // Extract last_updated
-  int updateStart = payload.indexOf("\"last_updated\":\"");
-  if (updateStart != -1) {
-    updateStart += 16; // Skip "\"last_updated\":\""
-    int updateEnd = payload.indexOf("\"", updateStart);
-    if (updateEnd != -1) {
-      payload.substring(updateStart, updateEnd).toCharArray(lastUpdated, 20);
-    }
-  }
-  
-  // Extract platform_1 data - find the entire array including brackets
-  int platform1Start = payload.indexOf("\"platform_1\":[");
-  if (platform1Start != -1) {
-    platform1Start += 14; // Skip "\"platform_1\":["
-    int bracketCount = 1;
-    int platform1End = platform1Start;
-    
-    // Find the matching closing bracket for the array
-    while (bracketCount > 0 && platform1End < payload.length()) {
-      if (payload[platform1End] == '[') {
-        bracketCount++;
-      } else if (payload[platform1End] == ']') {
-        bracketCount--;
-      }
-      platform1End++;
-    }
-    
-    if (bracketCount == 0) {
-      // platform1End now points to the character after the closing bracket
-      // We need to go back one to get the actual closing bracket position
-      platform1End--;
-      payload.substring(platform1Start, platform1End).toCharArray(platform1Data, 2000);
-    }
-  }
-  
-  // Extract platform_2 data - find the entire array including brackets
-  int platform2Start = payload.indexOf("\"platform_2\":[");
-  if (platform2Start != -1) {
-    platform2Start += 14; // Skip "\"platform_2\":["
-    int bracketCount = 1;
-    int platform2End = platform2Start;
-    
-    // Find the matching closing bracket for the array
-    while (bracketCount > 0 && platform2End < payload.length()) {
-      if (payload[platform2End] == '[') {
-        bracketCount++;
-      } else if (payload[platform2End] == ']') {
-        bracketCount--;
-      }
-      platform2End++;
-    }
-    
-    if (bracketCount == 0) {
-      // platform2End now points to the character after the closing bracket
-      // We need to go back one to get the actual closing bracket position
-      platform2End--;
-      payload.substring(platform2Start, platform2End).toCharArray(platform2Data, 2000);
-    }
-  }
-  
-  return true;
-}
-
-/* Fast refresh for train data area only ------------------------------------*/
-void partialRefreshTrainData(char* lastUpdated, char* platform1Data, char* platform2Data) {
-  // Always do a full refresh but use fast refresh mode
-  // This avoids the noise issues with partial refresh
-  
+void drawMainScreen(char* stationName, char* lastUpdated, char* platform1Data, char* platform2Data) {
+  // IMPORTANT: Reset Paint attributes to full screen size
+  Paint_NewImage(imageBuffer, EPD_7IN5_V2_WIDTH, EPD_7IN5_V2_HEIGHT, 0, WHITE);
   Paint_SelectImage(imageBuffer);
   Paint_Clear(WHITE);
   
-  // Station header (left justified)
   char header[100];
-  snprintf(header, sizeof(header), "Hassocks Station"); // Hardcoded station name for now
+  snprintf(header, sizeof(header), "%s Station", stationName);
   Paint_DrawString_EN(20, 10, header, &Font24, WHITE, BLACK);
   
-  // Last updated (right justified on same line)
   char updateStr[50];
   snprintf(updateStr, sizeof(updateStr), "Updated: %s", lastUpdated);
   Paint_DrawString_EN(600, 10, updateStr, &Font16, WHITE, BLACK);
   
-  // Platform headers
   Paint_DrawString_EN(40, 50, "Platform 1", &Font20, WHITE, BLACK);
   Paint_DrawString_EN(440, 50, "Platform 2", &Font20, WHITE, BLACK);
   
-  // Column headers
   Paint_DrawString_EN(40, 80, "Time", &Font16, WHITE, BLACK);
   Paint_DrawString_EN(100, 80, "Destination", &Font16, WHITE, BLACK);
   Paint_DrawString_EN(280, 80, "Status", &Font16, WHITE, BLACK);
@@ -404,144 +277,151 @@ void partialRefreshTrainData(char* lastUpdated, char* platform1Data, char* platf
   Paint_DrawString_EN(500, 80, "Destination", &Font16, WHITE, BLACK);
   Paint_DrawString_EN(680, 80, "Status", &Font16, WHITE, BLACK);
   
-  // Platform 1 trains
-  for (int row = 0; row < 5; row++) {
-    char time[10] = "";
-    char destination[50] = "";
-    char operatorName[30] = "";
-    char status[20] = "";
-    char statusClass[20] = "";
-    bool isCancelled = false;
-    
-    if (extractTrainData(platform1Data, row, time, destination, operatorName, status, statusClass, &isCancelled)) {
-      bool isDelayed = (strcmp(statusClass, "status-delayed") == 0);
-      
-      displayTrainRow(1, row, time, destination, operatorName, status, isDelayed);
-    }
+  if (strlen(platform1Data) == 0 || strcmp(platform1Data, "[]") == 0) {
+      Paint_DrawString_EN(40, 110, "No services", &Font20, WHITE, BLACK);
+  } else {
+      for (int row = 0; row < 5; row++) {
+        char time[10] = "", destination[50] = "", operatorName[30] = "", status[20] = "", statusClass[20] = "";
+        bool isCancelled = false;
+        if (extractTrainData(platform1Data, row, time, destination, operatorName, status, statusClass, &isCancelled)) {
+          displayTrainRow(1, row, time, destination, operatorName, status, strcmp(statusClass, "status-delayed") == 0);
+        }
+      }
   }
   
-  // Platform 2 trains
-  for (int row = 0; row < 5; row++) {
-    char time[10] = "";
-    char destination[50] = "";
-    char operatorName[30] = "";
-    char status[20] = "";
-    char statusClass[20] = "";
-    bool isCancelled = false;
-    
-    if (extractTrainData(platform2Data, row, time, destination, operatorName, status, statusClass, &isCancelled)) {
-      bool isDelayed = (strcmp(statusClass, "status-delayed") == 0);
-      
-      displayTrainRow(2, row, time, destination, operatorName, status, isDelayed);
-    }
+  if (strlen(platform2Data) == 0 || strcmp(platform2Data, "[]") == 0) {
+      Paint_DrawString_EN(440, 110, "No services", &Font20, WHITE, BLACK);
+  } else {
+      for (int row = 0; row < 5; row++) {
+        char time[10] = "", destination[50] = "", operatorName[30] = "", status[20] = "", statusClass[20] = "";
+        bool isCancelled = false;
+        if (extractTrainData(platform2Data, row, time, destination, operatorName, status, statusClass, &isCancelled)) {
+          displayTrainRow(2, row, time, destination, operatorName, status, strcmp(statusClass, "status-delayed") == 0);
+        }
+      }
   }
-  
-  // Use fast display for subsequent updates
-  EPD_7IN5_V2_Display(imageBuffer);
-  printf("Fast refresh completed\n");
 }
 
-/* Extract train data from platform array ------------------------------------*/
-bool extractTrainData(const char* platformData, int trainIndex, char* time, char* destination, char* operatorName, char* status, char* statusClass, bool* isCancelled) {
-  if (strlen(platformData) == 0) {
+void performPartialTimestampUpdate(char* lastUpdated) {
+    EPD_7IN5_V2_Init_Part_NoReset();
+    
+    UWORD updateW = 200, updateH = 30;
+    UWORD bufferSize = ((updateW % 8 == 0) ? (updateW / 8) : (updateW / 8 + 1)) * updateH;
+    UBYTE *timeBuffer = (UBYTE *)malloc(bufferSize);
+    
+    if (timeBuffer == NULL) return;
+    
+    // Create tiny image for partial refresh
+    Paint_NewImage(timeBuffer, updateW, updateH, 0, WHITE);
+    Paint_SelectImage(timeBuffer);
+    Paint_Clear(WHITE);
+    
+    char updateStr[50];
+    snprintf(updateStr, sizeof(updateStr), "Updated: %s", lastUpdated);
+    Paint_DrawString_EN(0, 0, updateStr, &Font16, WHITE, BLACK);
+    
+    EPD_7IN5_V2_Display_Part(timeBuffer, 600, 10, 600 + updateW, 10 + updateH);
+    free(timeBuffer);
+}
+
+bool isQuietHours() {
+    struct tm timeinfo;
+    if(!getLocalTime(&timeinfo)) {
+        return false;
+    }
+    if (timeinfo.tm_hour >= 1 && timeinfo.tm_hour < 5) {
+        return true;
+    }
     return false;
-  }
-  
-  // Find the nth train object in the platform array
+}
+
+bool extractTrainData(const char* platformData, int trainIndex, char* time, char* destination, char* operatorName, char* status, char* statusClass, bool* isCancelled) {
+  if (strlen(platformData) == 0) return false;
   const char* currentPos = platformData;
   for (int i = 0; i <= trainIndex; i++) {
     currentPos = strstr(currentPos, "{");
-    if (currentPos == NULL) {
-      return false;
-    }
-    
+    if (currentPos == NULL) return false;
     if (i < trainIndex) {
       currentPos = strstr(currentPos, "},");
-      if (currentPos == NULL) {
-        return false;
-      }
+      if (currentPos == NULL) return false;
       currentPos += 2;
     }
   }
-  
   const char* trainEnd = strstr(currentPos, "}");
-  if (trainEnd == NULL) {
-    return false;
-  }
-  
-  // Extract fields from the train object
+  if (trainEnd == NULL) return false;
   String trainStr = String(currentPos).substring(0, trainEnd - currentPos);
   
-  // Debug: Print the train object being parsed
-  printf("Train %d object: %s\n", trainIndex, trainStr.c_str());
-  
-  // Extract std (time) - note: no space after colon in actual JSON
   int timeStart = trainStr.indexOf("\"std\":\"");
   if (timeStart != -1) {
-    timeStart += 7; // Skip "\"std\":\""
+    timeStart += 7;
     int timeEnd = trainStr.indexOf("\"", timeStart);
-    if (timeEnd != -1) {
-      trainStr.substring(timeStart, timeEnd).toCharArray(time, 10);
-      printf("  Time: %s\n", time);
-    }
+    if (timeEnd != -1) trainStr.substring(timeStart, timeEnd).toCharArray(time, 10);
   }
-  
-  // Extract destination - note: no space after colon in actual JSON
   int destStart = trainStr.indexOf("\"destination\":\"");
   if (destStart != -1) {
-    destStart += 15; // Skip "\"destination\":\""
+    destStart += 15;
     int destEnd = trainStr.indexOf("\"", destStart);
-    if (destEnd != -1) {
-      trainStr.substring(destStart, destEnd).toCharArray(destination, 50);
-      printf("  Destination: %s\n", destination);
-    }
+    if (destEnd != -1) trainStr.substring(destStart, destEnd).toCharArray(destination, 50);
   }
-  
-  // Extract operator - note: no space after colon in actual JSON
   int opStart = trainStr.indexOf("\"operator\":\"");
   if (opStart != -1) {
-    opStart += 12; // Skip "\"operator\":\""
+    opStart += 12;
     int opEnd = trainStr.indexOf("\"", opStart);
-    if (opEnd != -1) {
-      trainStr.substring(opStart, opEnd).toCharArray(operatorName, 30);
-      printf("  Operator: %s\n", operatorName);
-    }
+    if (opEnd != -1) trainStr.substring(opStart, opEnd).toCharArray(operatorName, 30);
   }
-  
-  // Extract etd (status) - note: no space after colon in actual JSON
   int statusStart = trainStr.indexOf("\"etd\":\"");
   if (statusStart != -1) {
-    statusStart += 7; // Skip "\"etd\":\""
+    statusStart += 7;
     int statusEnd = trainStr.indexOf("\"", statusStart);
-    if (statusEnd != -1) {
-      trainStr.substring(statusStart, statusEnd).toCharArray(status, 20);
-      printf("  Status: %s\n", status);
-    }
+    if (statusEnd != -1) trainStr.substring(statusStart, statusEnd).toCharArray(status, 20);
   }
-  
-  // Extract status_class - note: no space after colon in actual JSON
   int classStart = trainStr.indexOf("\"status_class\":\"");
   if (classStart != -1) {
-    classStart += 16; // Skip "\"status_class\":\""
+    classStart += 16;
     int classEnd = trainStr.indexOf("\"", classStart);
-    if (classEnd != -1) {
-      trainStr.substring(classStart, classEnd).toCharArray(statusClass, 20);
-      printf("  Status Class: %s\n", statusClass);
-    }
+    if (classEnd != -1) trainStr.substring(classStart, classEnd).toCharArray(statusClass, 20);
   }
-  
-  // Extract is_cancelled - note: no space after colon in actual JSON
   int cancelStart = trainStr.indexOf("\"is_cancelled\":");
   if (cancelStart != -1) {
-    cancelStart += 15; // Skip "\"is_cancelled\":"
+    cancelStart += 15;
     int cancelEnd = trainStr.indexOf(",", cancelStart);
     if (cancelEnd == -1) cancelEnd = trainStr.indexOf("}", cancelStart);
     if (cancelEnd != -1) {
       String cancelStr = trainStr.substring(cancelStart, cancelEnd);
       *isCancelled = (cancelStr == "true");
-      printf("  Is Cancelled: %s\n", *isCancelled ? "true" : "false");
     }
   }
-  
+  return true;
+}
+
+bool parseJSONResponse(String& payload, char* stationName, char* lastUpdated, char* platform1Data, char* platform2Data) {
+  int updateStart = payload.indexOf("\"last_updated\":\"");
+  if (updateStart != -1) {
+    updateStart += 16; 
+    int updateEnd = payload.indexOf("\"", updateStart);
+    if (updateEnd != -1) payload.substring(updateStart, updateEnd).toCharArray(lastUpdated, 20);
+  }
+  int p1Start = payload.indexOf("\"platform_1\":[");
+  if (p1Start != -1) {
+    p1Start += 14; 
+    int bracketCount = 1, p1End = p1Start;
+    while (bracketCount > 0 && p1End < payload.length()) {
+      if (payload[p1End] == '[') bracketCount++;
+      else if (payload[p1End] == ']') bracketCount--;
+      p1End++;
+    }
+    if (bracketCount == 0) payload.substring(p1Start, p1End-1).toCharArray(platform1Data, 2000);
+  }
+  int p2Start = payload.indexOf("\"platform_2\":[");
+  if (p2Start != -1) {
+    p2Start += 14; 
+    int bracketCount = 1, p2End = p2Start;
+    while (bracketCount > 0 && p2End < payload.length()) {
+      if (payload[p2End] == '[') bracketCount++;
+      else if (payload[p2End] == ']') bracketCount--;
+      p2End++;
+    }
+    if (bracketCount == 0) payload.substring(p2Start, p2End-1).toCharArray(platform2Data, 2000);
+  }
   return true;
 }

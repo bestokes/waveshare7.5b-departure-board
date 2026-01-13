@@ -43,6 +43,7 @@
 UBYTE EPD_7IN5_V2_Init(void);
 UBYTE EPD_7IN5_V2_Init_Fast(void);
 UBYTE EPD_7IN5_V2_Init_Part(void);
+UBYTE EPD_7IN5_V2_Init_Part_NoReset(void);
 void EPD_7IN5_V2_Clear(void);
 void EPD_7IN5_V2_ClearBlack(void);
 void EPD_7IN5_V2_Display(UBYTE *blackimage);

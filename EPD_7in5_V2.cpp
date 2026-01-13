@@ -197,6 +197,25 @@ UBYTE EPD_7IN5_V2_Init_Part(void)
     return 0;
 }
 
+UBYTE EPD_7IN5_V2_Init_Part_NoReset(void)
+{
+    // EPD_Reset(); // Intentionally removed to preserve RAM
+ 
+	EPD_SendCommand(0X00);			//PANNEL SETTING
+	EPD_SendData(0x1F);   //KW-3f   KWR-2F	BWROTP 0f	BWOTP 1f
+	
+	EPD_SendCommand(0x04); //POWER ON
+	DEV_Delay_ms(100); 
+	EPD_WaitUntilIdle();        //waiting for the electronic paper IC to release the idle signal
+	
+	EPD_SendCommand(0xE0);
+	EPD_SendData(0x02);
+	EPD_SendCommand(0xE5);
+	EPD_SendData(0x6E);
+	
+    return 0;
+}
+
 /******************************************************************************
 function :	Clear screen
 parameter:
