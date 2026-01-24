@@ -11,7 +11,7 @@
 #include <time.h>
 
 /* WiFi credentials */
-const char* ssid = "ssid-name";
+const char* ssid = "ssid";
 const char* password = "password";
 
 /* NTP Server */
@@ -27,7 +27,7 @@ UBYTE *imageBuffer;
 UWORD imageSize;
 
 /* Refresh interval */
-const unsigned long refreshInterval = 30000; // 30 seconds
+unsigned long refreshInterval = 60000; // Default 1 minute
 unsigned long lastRefresh = 0;
 unsigned long lastFullRefresh = 0;
 const unsigned long fullRefreshInterval = 3600000; // 1 hour
@@ -65,7 +65,6 @@ void setup()
 
   // Calculate image buffer size (800x480 monochrome)
   imageSize = ((EPD_7IN5_V2_WIDTH % 8 == 0) ? (EPD_7IN5_V2_WIDTH / 8) : (EPD_7IN5_V2_WIDTH / 8 + 1)) * EPD_7IN5_V2_HEIGHT;
-  
   printf("Buffer size: %d bytes\n", imageSize);
   
   // Allocate image buffer
@@ -75,10 +74,17 @@ void setup()
     while(1);
   }
   
-  // Initialize paint with image buffer (1-bit monochrome)
+  // Initialize paint with image buffer
   Paint_NewImage(imageBuffer, EPD_7IN5_V2_WIDTH, EPD_7IN5_V2_HEIGHT, 0, WHITE);
+  Paint_SelectImage(imageBuffer);
+  Paint_Clear(WHITE);
   Paint_SetScale(2);
   Paint_SetRotate(ROTATE_0);
+
+  // Show "Initialising, please wait ..." screen
+  Paint_DrawString_EN(180, 220, "Hassocks Station Departure Board", &Font20, WHITE, BLACK);
+  EPD_7IN5_V2_Display(imageBuffer);
+  DEV_Delay_ms(500);
   
   // Connect to WiFi
   if (!connectToWiFi()) {
@@ -103,6 +109,7 @@ void loop()
     // Fetch and display train times
     if (!fetchAndDisplayTrainTimes()) {
       printf("Failed to fetch train times, will retry in 30 seconds...\r\n");
+      refreshInterval = 30000;
     }
     
     lastRefresh = currentTime;
@@ -186,17 +193,15 @@ bool fetchAndDisplayTrainTimes() {
         printf("Data unchanged, partial update only.\n");
         performPartialTimestampUpdate(lastUpdated);
         strcpy(lastUpdatedTime, lastUpdated); 
+        refreshInterval = 60000; // 1 minute when data unchanged
         return true;
     }
     
     printf("Redrawing main screen\n");
     
-    if (firstDisplay || hourlyRefreshNeeded) {
-        EPD_7IN5_V2_Init();
-        lastFullRefresh = currentTime;
-    } else {
-        EPD_7IN5_V2_Init_Fast();
-    }
+    // Always use full Init for main screen redraw as requested (no Init_Fast)
+    EPD_7IN5_V2_Init();
+    lastFullRefresh = currentTime;
     
     drawMainScreen(stationName, lastUpdated, platform1Data, platform2Data);
     EPD_7IN5_V2_Display(imageBuffer);
@@ -205,6 +210,15 @@ bool fetchAndDisplayTrainTimes() {
     strcpy(lastUpdatedTime, lastUpdated);
     strcpy(lastPlatform1Data, platform1Data);
     strcpy(lastPlatform2Data, platform2Data);
+    
+    // Set timing for next check
+    if (dataChanged) {
+        printf("Data changed, next refresh in 2 minutes.\n");
+        refreshInterval = 120000; // 2 minutes
+    } else {
+        printf("Data unchanged (or first/hourly), next refresh in 1 minute.\n");
+        refreshInterval = 60000; // 1 minute
+    }
     
     return true;
     
