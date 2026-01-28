@@ -5,11 +5,9 @@ This program fetches train departure times from a JSON API and displays them on 
 ## Features
 
 - **WiFi Connectivity**: Connects to local WiFi network
-- **JSON API Integration**: Fetches real-time train data from `http://192.168.1.131:5001/api/departures`
+- **JSON API Integration**: Fetches real-time train data from local api
 - **Two-Column Display**: Shows Platform 1 and Platform 2 departures side by side
-- **Real-time Updates**: Collect data every 30 seconds, only refresh when necessary
 - **Memory Efficient**: Uses minimal memory with 1-bit monochrome display
-- **Error Handling**: Displays clear error messages when issues occur
 - **Partial refresh**: Only update the updated time if everything else is unchanged
 
 ## Hardware Requirements
@@ -37,9 +35,7 @@ This program fetches train departure times from a JSON API and displays them on 
 
 ## Notes
 
-- The display uses 1-bit monochrome mode for maximum memory efficiency
 - Train destinations are truncated with a dot if too long to fit in the column
 - Delayed trains are indicated in the status column
-- The ESP32 has sufficient memory for all operations
 - When the json response is empty, it will show 'no services'
-- Project based on the demo files provided by Waveshare.
+- This project is based on the e-paper demo files provided by Waveshare.
